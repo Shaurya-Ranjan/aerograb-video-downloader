@@ -10,6 +10,29 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
+// Helper to get common yt-dlp arguments
+const getCommonArgs = () => {
+    const args = {
+        noCheckCertificates: true,
+        noWarnings: true,
+        addHeader: [
+            'referer:youtube.com',
+            'user-agent:Mozilla/5.0 (Windows NT 10.0; Win64; x64)'
+        ],
+        // ✨ BOT DETECTION BYPASS: Use Android player client which is less strictly challenged
+        extractorArgs: 'youtube:player_client=android,web'
+    };
+
+    // ✨ COOKIE SUPPORT: If a cookies.txt exists in the root, use it for authentication
+    const cookiesPath = path.join(__dirname, 'cookies.txt');
+    if (fs.existsSync(cookiesPath)) {
+        args.cookies = cookiesPath;
+        console.log('Using cookies.txt for authentication');
+    }
+
+    return args;
+};
+
 // Endpoint to fetch metadata
 app.post('/api/info', async (req, res) => {
     const { url } = req.body;
@@ -19,14 +42,9 @@ app.post('/api/info', async (req, res) => {
 
     try {
         const info = await youtubedl(url, {
+            ...getCommonArgs(),
             dumpSingleJson: true,
-            noCheckCertificates: true,
-            noWarnings: true,
-            preferFreeFormats: true,
-            addHeader: [
-                'referer:youtube.com',
-                'user-agent:Mozilla/5.0 (Windows NT 10.0; Win64; x64)'
-            ]
+            preferFreeFormats: true
         });
 
         const formats = info.formats || [];
@@ -66,49 +84,40 @@ app.get('/api/download', async (req, res) => {
     }
 
     let finalTitle = title ? title.trim() : "high_bitrate_video";
-    finalTitle = finalTitle.replace(/[\r\n]+/g, ' ').replace(/[^\w\s\Hindi\u0900-\u097F]/gi, '_');
+    finalTitle = finalTitle.replace(/[\r\n]+/g, ' ').replace(/[^\w\s\u0900-\u097F]/gi, '_');
 
-    // Create a unique temporary filename in the system /tmp directory
     const tempId = crypto.randomBytes(8).toString('hex');
     const tempDir = '/tmp';
     
-    // Ensure temp dir exists (Render/Vercel normally have /tmp)
     if (!fs.existsSync(tempDir)) {
         fs.mkdirSync(tempDir, { recursive: true });
     }
 
     const tempFilePath = path.join(tempDir, `aerograb_${tempId}.mkv`);
-
-    // Muxing: Instruct yt-dlp to merge the video and audio into a file
     const formatReq = format && format !== 'best' ? `${format}+bestaudio/best` : 'bestvideo+bestaudio/best';
 
     try {
         console.log(`Starting download to temp file: ${tempFilePath}`);
         
-        // Execute yt-dlp to download and merge to the local temp file
         await youtubedl(url, {
+            ...getCommonArgs(),
             format: formatReq,
             output: tempFilePath,
             mergeOutputFormat: 'mkv',
-            ffmpegLocation: ffmpegPath,
-            noCheckCertificates: true
+            ffmpegLocation: ffmpegPath
         });
 
-        // Verify the file was created and has size
         if (!fs.existsSync(tempFilePath) || fs.statSync(tempFilePath).size === 0) {
             throw new Error("File creation failed or empty file.");
         }
 
-        // Set headers for file download
         res.header('Content-Disposition', `attachment; filename="video.mkv"; filename*=UTF-8''${encodeURIComponent(finalTitle)}.mkv`);
         res.header('Content-Type', 'video/x-matroska');
         res.header('Content-Length', fs.statSync(tempFilePath).size);
 
-        // Stream the completed file to the user
         const readStream = fs.createReadStream(tempFilePath);
         readStream.pipe(res);
 
-        // Cleanup: Delete the temp file once the stream ends or client disconnects
         res.on('finish', () => {
             fs.unlink(tempFilePath, (err) => {
                 if (err) console.error(`Error deleting temp file: ${err}`);
@@ -117,7 +126,6 @@ app.get('/api/download', async (req, res) => {
         });
 
         res.on('close', () => {
-             // Handle case where user cancels the download before it finishes
              if (fs.existsSync(tempFilePath)) {
                  fs.unlink(tempFilePath, () => {});
              }
@@ -128,7 +136,6 @@ app.get('/api/download', async (req, res) => {
         if (!res.headersSent) {
             res.status(500).send('Download failed during muxing or processing.');
         }
-        // Cleanup on error
         if (fs.existsSync(tempFilePath)) {
             fs.unlink(tempFilePath, () => {});
         }
