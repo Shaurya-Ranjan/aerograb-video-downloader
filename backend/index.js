@@ -1,39 +1,68 @@
 const express = require('express');
 const cors = require('cors');
-const youtubedl = require('youtube-dl-exec');
-const ffmpegPath = require('ffmpeg-static');
-const path = require('path');
-const fs = require('fs');
-const crypto = require('crypto');
 
 const app = express();
 app.use(cors());
 app.use(express.json());
 
-// Helper to get common yt-dlp arguments
-const getCommonArgs = () => {
-    const args = {
-        noCheckCertificates: true,
-        noWarnings: true,
-        addHeader: [
-            'referer:youtube.com',
-            'user-agent:Mozilla/5.0 (Windows NT 10.0; Win64; x64)'
-        ],
-        // ✨ BOT DETECTION BYPASS: Use Android player client which is less strictly challenged
-        extractorArgs: 'youtube:player_client=android,web'
-    };
+// ── Cobalt API Configuration ──────────────────────────────────────────
+// Community Cobalt instances ranked by reliability (from instances.cobalt.best)
+const COBALT_INSTANCES = [
+    'https://cobalt-api.meowing.de',       // 96% uptime
+    'https://cobalt-backend.canine.tools', // 84% uptime
+    'https://capi.3kh0.net'                // 80% uptime
+];
 
-    // ✨ COOKIE SUPPORT: If a cookies.txt exists in the root, use it for authentication
-    const cookiesPath = path.join(__dirname, 'cookies.txt');
-    if (fs.existsSync(cookiesPath)) {
-        args.cookies = cookiesPath;
-        console.log('Using cookies.txt for authentication');
+// Quality presets for the format selection UI
+const QUALITY_PRESETS = [
+    { id: '4320', label: '8K', resolution: '7680x4320' },
+    { id: '2160', label: '4K', resolution: '3840x2160' },
+    { id: '1440', label: '2K', resolution: '2560x1440' },
+    { id: '1080', label: '1080p', resolution: '1920x1080' },
+    { id: '720',  label: '720p',  resolution: '1280x720' },
+    { id: '480',  label: '480p',  resolution: '854x480' },
+    { id: '360',  label: '360p',  resolution: '640x360' },
+];
+
+// ── Helper: Call Cobalt API with automatic fallback ───────────────────
+async function callCobalt(body) {
+    let lastError = null;
+
+    for (const instance of COBALT_INSTANCES) {
+        try {
+            console.log(`Trying Cobalt instance: ${instance}`);
+            const response = await fetch(`${instance}/`, {
+                method: 'POST',
+                headers: {
+                    'Accept': 'application/json',
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify(body),
+                signal: AbortSignal.timeout(30000) // 30s timeout
+            });
+
+            const data = await response.json();
+
+            if (data.status === 'error') {
+                console.log(`Cobalt instance ${instance} returned error:`, data.error);
+                lastError = data.error;
+                continue; // try next instance
+            }
+
+            console.log(`Success from ${instance}, status: ${data.status}`);
+            return data;
+
+        } catch (err) {
+            console.log(`Cobalt instance ${instance} failed:`, err.message);
+            lastError = err.message;
+            continue;
+        }
     }
 
-    return args;
-};
+    throw new Error(lastError || 'All Cobalt instances failed');
+}
 
-// Endpoint to fetch metadata
+// ── Endpoint: Fetch video metadata ───────────────────────────────────
 app.post('/api/info', async (req, res) => {
     const { url } = req.body;
     if (!url) {
@@ -41,108 +70,119 @@ app.post('/api/info', async (req, res) => {
     }
 
     try {
-        const info = await youtubedl(url, {
-            ...getCommonArgs(),
-            dumpSingleJson: true,
-            preferFreeFormats: true
+        // Use noembed.com for universal metadata (YouTube, Vimeo, Dailymotion, etc.)
+        const metaResponse = await fetch(`https://noembed.com/embed?url=${encodeURIComponent(url)}`);
+        const meta = await metaResponse.json();
+
+        // Also do a quick Cobalt check to verify the URL is supported
+        const cobaltCheck = await callCobalt({
+            url: url,
+            videoQuality: '720',
+            youtubeVideoCodec: 'h264'
         });
 
-        const formats = info.formats || [];
-        
-        const mappedFormats = formats
-            .filter(f => f.vcodec !== 'none')
-            .sort((a, b) => (b.height || 0) - (a.height || 0))
-            .filter((value, index, self) => index === self.findIndex((t) => t.height === value.height))
-            .slice(0, 15)
-            .map(f => ({
-                format_id: f.format_id,
-                resolution: f.resolution,
-                ext: f.ext,
-                vcodec: f.vcodec,
-                acodec: f.acodec,
-                filesize: f.filesize
-            }));
-
+        // Build the response with quality presets
         res.json({
-            title: info.title,
-            thumbnail: info.thumbnail,
-            duration: info.duration_string || info.duration,
-            formats: mappedFormats,
-            url: url
+            title: meta.title || 'Unknown Video',
+            thumbnail: meta.thumbnail_url || '',
+            duration: meta.duration || 'N/A',
+            author: meta.author_name || '',
+            formats: QUALITY_PRESETS.map(q => ({
+                format_id: q.id,
+                resolution: q.resolution,
+                ext: 'mp4',
+                label: q.label,
+                vcodec: 'h264',
+                acodec: 'aac',
+                filesize: null
+            })),
+            url: url,
+            cobaltStatus: cobaltCheck.status // 'tunnel' or 'redirect'
         });
+
     } catch (error) {
-         console.error('Error fetching info:', error);
-         res.status(500).json({ error: 'Failed to retrieve video metadata. Ensure the URL is public and valid.' });
+        console.error('Error fetching info:', error.message);
+        res.status(500).json({ 
+            error: 'Failed to retrieve video metadata. Ensure the URL is public and supported.' 
+        });
     }
 });
 
-// Endpoint to stream download
+// ── Endpoint: Download via Cobalt ────────────────────────────────────
 app.get('/api/download', async (req, res) => {
-    const { url, format, title } = req.query;
+    const { url, quality, title } = req.query;
     if (!url) {
         return res.status(400).send('URL is required');
     }
 
-    let finalTitle = title ? title.trim() : "high_bitrate_video";
-    finalTitle = finalTitle.replace(/[\r\n]+/g, ' ').replace(/[^\w\s\u0900-\u097F]/gi, '_');
-
-    const tempId = crypto.randomBytes(8).toString('hex');
-    const tempDir = '/tmp';
-    
-    if (!fs.existsSync(tempDir)) {
-        fs.mkdirSync(tempDir, { recursive: true });
-    }
-
-    const tempFilePath = path.join(tempDir, `aerograb_${tempId}.mkv`);
-    const formatReq = format && format !== 'best' ? `${format}+bestaudio/best` : 'bestvideo+bestaudio/best';
-
     try {
-        console.log(`Starting download to temp file: ${tempFilePath}`);
-        
-        await youtubedl(url, {
-            ...getCommonArgs(),
-            format: formatReq,
-            output: tempFilePath,
-            mergeOutputFormat: 'mkv',
-            ffmpegLocation: ffmpegPath
+        const cobaltResult = await callCobalt({
+            url: url,
+            videoQuality: quality || '1080',
+            youtubeVideoCodec: 'h264',
+            filenameStyle: 'pretty'
         });
 
-        if (!fs.existsSync(tempFilePath) || fs.statSync(tempFilePath).size === 0) {
-            throw new Error("File creation failed or empty file.");
-        }
+        if (cobaltResult.status === 'redirect' || cobaltResult.status === 'tunnel') {
+            // Cobalt gives us a direct URL — redirect the user's browser to it
+            const downloadUrl = cobaltResult.url;
 
-        res.header('Content-Disposition', `attachment; filename="video.mkv"; filename*=UTF-8''${encodeURIComponent(finalTitle)}.mkv`);
-        res.header('Content-Type', 'video/x-matroska');
-        res.header('Content-Length', fs.statSync(tempFilePath).size);
+            // Stream the file through our server to set proper filename headers
+            let finalTitle = title ? title.trim() : 'aerograb_video';
+            finalTitle = finalTitle.replace(/[\r\n]+/g, ' ');
+            const filename = cobaltResult.filename || `${finalTitle}.mp4`;
 
-        const readStream = fs.createReadStream(tempFilePath);
-        readStream.pipe(res);
+            // Proxy the download through our server for proper headers
+            const fileResponse = await fetch(downloadUrl);
 
-        res.on('finish', () => {
-            fs.unlink(tempFilePath, (err) => {
-                if (err) console.error(`Error deleting temp file: ${err}`);
-                else console.log(`Cleaned up temp file: ${tempFilePath}`);
+            if (!fileResponse.ok) {
+                throw new Error(`Failed to fetch file: ${fileResponse.status}`);
+            }
+
+            res.header('Content-Disposition', `attachment; filename="${filename}"; filename*=UTF-8''${encodeURIComponent(filename)}`);
+            res.header('Content-Type', fileResponse.headers.get('content-type') || 'video/mp4');
+
+            const contentLength = fileResponse.headers.get('content-length') || 
+                                  fileResponse.headers.get('estimated-content-length');
+            if (contentLength) {
+                res.header('Content-Length', contentLength);
+            }
+
+            // Pipe the stream directly to the user
+            const { Readable } = require('stream');
+            const nodeStream = Readable.fromWeb(fileResponse.body);
+            nodeStream.pipe(res);
+
+            nodeStream.on('error', () => {
+                if (!res.headersSent) res.status(500).send('Download stream error');
             });
-        });
 
-        res.on('close', () => {
-             if (fs.existsSync(tempFilePath)) {
-                 fs.unlink(tempFilePath, () => {});
-             }
-        });
+        } else if (cobaltResult.status === 'picker') {
+            // Multiple items (e.g., gallery) — redirect to first video
+            const firstVideo = cobaltResult.picker.find(p => p.type === 'video') || cobaltResult.picker[0];
+            if (firstVideo) {
+                return res.redirect(firstVideo.url);
+            }
+            throw new Error('No downloadable items found');
+
+        } else {
+            throw new Error(`Unexpected Cobalt status: ${cobaltResult.status}`);
+        }
 
     } catch (error) {
-        console.error('Download error:', error);
+        console.error('Download error:', error.message);
         if (!res.headersSent) {
-            res.status(500).send('Download failed during muxing or processing.');
-        }
-        if (fs.existsSync(tempFilePath)) {
-            fs.unlink(tempFilePath, () => {});
+            res.status(500).send('Download failed. Please try a different quality or URL.');
         }
     }
 });
 
+// ── Health check ─────────────────────────────────────────────────────
+app.get('/health', (req, res) => {
+    res.json({ status: 'ok', engine: 'cobalt', version: '2.0.0' });
+});
+
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, '0.0.0.0', () => {
-    console.log(`Video Downloader backend running on port ${PORT}`);
+    console.log(`AeroGrab backend (Cobalt) running on port ${PORT}`);
 });

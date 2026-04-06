@@ -32,10 +32,9 @@ function App() {
     }
   };
 
-  const downloadVideo = (formatId) => {
+  const downloadVideo = (quality) => {
       const apiBaseUrl = import.meta.env.VITE_API_URL || 'http://localhost:3000';
-      // Pass the encodeURIComponent(videoInfo.title) so the backend can set the filename properly
-      window.location.href = `${apiBaseUrl}/api/download?url=${encodeURIComponent(url)}&title=${encodeURIComponent(videoInfo.title)}&format=${formatId}`;
+      window.location.href = `${apiBaseUrl}/api/download?url=${encodeURIComponent(url)}&title=${encodeURIComponent(videoInfo?.title || 'video')}&quality=${quality}`;
   };
 
   return (
@@ -64,14 +63,16 @@ function App() {
 
       {videoInfo && (
         <div className="preview-card visible">
-          <img src={videoInfo.thumbnail} alt="Video Thumbnail" className="preview-img" />
+          {videoInfo.thumbnail && (
+            <img src={videoInfo.thumbnail} alt="Video Thumbnail" className="preview-img" />
+          )}
           <div className="preview-info">
             <h2>{videoInfo.title}</h2>
-            <p>Duration: {videoInfo.duration}</p>
+            {videoInfo.author && <p className="author">by {videoInfo.author}</p>}
             <div className="download-options">
               {videoInfo.formats.map((fmt, idx) => (
                 <button key={idx} onClick={() => downloadVideo(fmt.format_id)} className="format-btn">
-                  Download {fmt.resolution || 'Audio Only'} ({fmt.ext}) {fmt.filesize ? `- ${(fmt.filesize / 1024 / 1024).toFixed(1)}MB` : ''}
+                  Download {fmt.label} ({fmt.ext})
                 </button>
               ))}
             </div>
