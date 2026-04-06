@@ -2,6 +2,9 @@ const express = require('express');
 const cors = require('cors');
 const youtubedl = require('youtube-dl-exec');
 const ffmpegPath = require('ffmpeg-static');
+const path = require('path');
+const fs = require('fs');
+const crypto = require('crypto');
 
 const app = express();
 app.use(cors());
@@ -28,12 +31,9 @@ app.post('/api/info', async (req, res) => {
 
         const formats = info.formats || [];
         
-        // Ensure we offer 4K and 8K videos without strictly filtering for MP4. 
-        // We will mux them properly using our internal ffmpeg automatically.
         const mappedFormats = formats
             .filter(f => f.vcodec !== 'none')
             .sort((a, b) => (b.height || 0) - (a.height || 0))
-            // Remove exact duplicate height records so the menu is clean
             .filter((value, index, self) => index === self.findIndex((t) => t.height === value.height))
             .slice(0, 15)
             .map(f => ({
@@ -59,42 +59,80 @@ app.post('/api/info', async (req, res) => {
 });
 
 // Endpoint to stream download
-app.get('/api/download', (req, res) => {
+app.get('/api/download', async (req, res) => {
     const { url, format, title } = req.query;
     if (!url) {
         return res.status(400).send('URL is required');
     }
 
     let finalTitle = title ? title.trim() : "high_bitrate_video";
-    // Strip only line-breaks to prevent HTTP header splitting. Let the browser handle standard OS forbidden characters.
-    finalTitle = finalTitle.replace(/[\r\n]+/g, ' ');
+    finalTitle = finalTitle.replace(/[\r\n]+/g, ' ').replace(/[^\w\s\Hindi\u0900-\u097F]/gi, '_');
 
-    // Set correct headers so browser downloads the file (streaming natively as MKV)
-    // We use RFC 5987 (filename*=UTF-8'') to natively allow exact unicode titles, hashtags, and special characters
-    res.header('Content-Disposition', `attachment; filename="video.mkv"; filename*=UTF-8''${encodeURIComponent(finalTitle)}.mkv`);
-    res.header('Content-Type', 'video/x-matroska');
+    // Create a unique temporary filename in the system /tmp directory
+    const tempId = crypto.randomBytes(8).toString('hex');
+    const tempDir = '/tmp';
+    
+    // Ensure temp dir exists (Render/Vercel normally have /tmp)
+    if (!fs.existsSync(tempDir)) {
+        fs.mkdirSync(tempDir, { recursive: true });
+    }
 
-    // Muxing: Specifically instruct yt-dlp to merge the absolute best video track requested with the absolute best audio track available
+    const tempFilePath = path.join(tempDir, `aerograb_${tempId}.mkv`);
+
+    // Muxing: Instruct yt-dlp to merge the video and audio into a file
     const formatReq = format && format !== 'best' ? `${format}+bestaudio/best` : 'bestvideo+bestaudio/best';
 
-    const subprocess = youtubedl.exec(url, {
-        format: formatReq,
-        output: '-', // output to stdout
-        mergeOutputFormat: 'mkv', // MKV container is the only format streamable to stdout reliably
-        ffmpegLocation: ffmpegPath,
-        noCheckCertificates: true
-    });
+    try {
+        console.log(`Starting download to temp file: ${tempFilePath}`);
+        
+        // Execute yt-dlp to download and merge to the local temp file
+        await youtubedl(url, {
+            format: formatReq,
+            output: tempFilePath,
+            mergeOutputFormat: 'mkv',
+            ffmpegLocation: ffmpegPath,
+            noCheckCertificates: true
+        });
 
-    // Pipe directly to the client
-    subprocess.stdout.pipe(res);
+        // Verify the file was created and has size
+        if (!fs.existsSync(tempFilePath) || fs.statSync(tempFilePath).size === 0) {
+            throw new Error("File creation failed or empty file.");
+        }
 
-    subprocess.stderr.on('data', (data) => {
-         // console.log(data.toString());
-    });
-    
-    subprocess.on('close', () => {
-        res.end();
-    });
+        // Set headers for file download
+        res.header('Content-Disposition', `attachment; filename="video.mkv"; filename*=UTF-8''${encodeURIComponent(finalTitle)}.mkv`);
+        res.header('Content-Type', 'video/x-matroska');
+        res.header('Content-Length', fs.statSync(tempFilePath).size);
+
+        // Stream the completed file to the user
+        const readStream = fs.createReadStream(tempFilePath);
+        readStream.pipe(res);
+
+        // Cleanup: Delete the temp file once the stream ends or client disconnects
+        res.on('finish', () => {
+            fs.unlink(tempFilePath, (err) => {
+                if (err) console.error(`Error deleting temp file: ${err}`);
+                else console.log(`Cleaned up temp file: ${tempFilePath}`);
+            });
+        });
+
+        res.on('close', () => {
+             // Handle case where user cancels the download before it finishes
+             if (fs.existsSync(tempFilePath)) {
+                 fs.unlink(tempFilePath, () => {});
+             }
+        });
+
+    } catch (error) {
+        console.error('Download error:', error);
+        if (!res.headersSent) {
+            res.status(500).send('Download failed during muxing or processing.');
+        }
+        // Cleanup on error
+        if (fs.existsSync(tempFilePath)) {
+            fs.unlink(tempFilePath, () => {});
+        }
+    }
 });
 
 const PORT = process.env.PORT || 3000;
